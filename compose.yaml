@@ -1,0 +1,25 @@
+# docker compose v2 — `docker compose up` starts only the API.
+# The `verify` service is a one-shot pytest runner behind a profile.
+services:
+  api:
+    build: .
+    image: fuel-cost-allocator
+    ports:
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  verify:
+    image: fuel-cost-allocator
+    profiles: ["verify"]
+    command: ["pytest", "-v"]
+    environment:
+      API_BASE_URL: http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: "no"
