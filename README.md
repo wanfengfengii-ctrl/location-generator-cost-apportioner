@@ -3,7 +3,8 @@
 纯后端 HTTP JSON 服务（Python 3.12 + FastAPI）。外景拍摄结束后，把同一台移动
 发电机的燃料发票总额（整数分）按各摄制组的 `watts × minutes` 整数权重，用
 **最大余数法（Hamilton 分摊）**拆到每个摄制组，保证分摊明细合计**始终严格等于**
-发票总额，财务可直接对平。
+发票总额，财务可直接对平。读数事后更正时，`POST /adjustments` 对同一发票总额
+各跑一次原始版与更正版分摊，直接返回每组可正可负的调账差额（合计恒为零）。
 
 ## 分摊算法与不变量
 
@@ -23,13 +24,15 @@
 
 ```
 app/
-  main.py        # FastAPI 应用与路由（POST /allocate、GET /health）
-  allocator.py   # 最大余数法核心逻辑（纯 Python，无框架依赖）
-  schemas.py     # 请求/响应模型（严格非负整数校验）
-  errors.py      # 统一错误信封，所有错误返回可定位字段
+  main.py         # FastAPI 应用与路由（POST /allocate、POST /adjustments、GET /health）
+  allocator.py    # 最大余数法核心逻辑（纯 Python，无框架依赖）
+  adjustments.py  # 调账编排：两版读数各跑一次分摊，按 unit_id 合并出差额
+  schemas.py      # 请求/响应模型（严格非负整数校验）
+  errors.py       # 统一错误信封，所有错误返回可定位字段
 tests/
-  test_api.py        # HTTP 验收测试（可打真实服务或进程内 TestClient）
-  test_allocator.py  # 分摊逻辑单元测试（含随机化不变量校验）
+  test_api.py          # HTTP 验收测试（可打真实服务或进程内 TestClient）
+  test_allocator.py    # 分摊逻辑单元测试（含随机化不变量校验）
+  test_adjustments.py  # 调账编排单元测试（含集合并发、整批拒绝校验）
 Dockerfile           # python:3.12-slim 单镜像
 compose.yaml         # api 服务 + 一次性 verify 验收服务
 requirements.txt / requirements-dev.txt
@@ -128,6 +131,78 @@ curl -s -X POST http://localhost:${API_PORT:-8000}/allocate \
 上例中三组精确份额为 6818.18…、2272.72…、909.09… 分；向下取整后剩 1 分，
 camera 组小数余数最大，获得该余分。合计 6818 + 2273 + 909 = 10000，与发票对平。
 
+### `POST /adjustments`
+
+拍摄结束后若摄制组更正了功率或使用时长，会计直接取得两版分摊的**调账差额**，
+无需手工比对两份 `/allocate` 结果。服务对同一发票总额分别用原始读数
+（`original_units`）和更正读数（`corrected_units`）各跑一次相同的最大余数法
+分摊，再按 `unit_id` 合并：
+
+- `adjustment_cents = corrected − original`，**可正、可负、可为零**；
+- 两版拆分的都是同一张发票，所以 `Σadjustment_cents` **恒为 0**，响应中的
+  `total_adjustment_cents` 即供核对的合计值；
+- `adjustments` 顺序与 `original_units` 一致（忽略更正数组自身的排列）。
+
+请求体：
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `total_cents` | int | 非负整数（与 `/allocate` 相同的严格整数校验） |
+| `original_units` / `corrected_units` | array | 各至少 1 个元素，元素结构与 `/allocate` 的 `units[]` 相同 |
+| 两组读数的 `unit_id` | — | 两组必须包含**完全相同**的组号集合，且组内各自唯一 |
+
+整批拒绝规则（不生成任何部分调账单）：
+
+- 任一数组内 `unit_id` 重复 → `400 DUPLICATE_UNIT_ID`，定位到重复出现的元素；
+- 两组组号集合不一致（缺失或额外）→ `400 UNIT_SET_MISMATCH`，对每个失配元素
+  分别给出定位（缺失的一方标在原数组，额外的一方标在更正数组）；
+- 任一版本权重总和为零 → `400 ZERO_TOTAL_WEIGHT`，`fields[].loc` 指向对应的
+  `original_units` 或 `corrected_units`。
+
+成功响应 `200`：
+
+| 字段 | 含义 |
+| --- | --- |
+| `total_cents` | 两版共用的发票总额（分） |
+| `original_total_weight` / `corrected_total_weight` | 两版权重总和 |
+| `total_adjustment_cents` | 调账合计，恒为 `0`（核对值） |
+| `adjustments[].original_cents` | 原始读数下该组分摊金额 |
+| `adjustments[].corrected_cents` | 更正读数下该组分摊金额 |
+| `adjustments[].adjustment_cents` | 调账差额（更正 − 原始，可正可负） |
+
+示例：
+
+```bash
+curl -s -X POST http://localhost:${API_PORT:-8000}/adjustments \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "total_cents": 10,
+        "original_units": [
+          {"unit_id": "a", "watts": 1, "minutes": 1},
+          {"unit_id": "b", "watts": 1, "minutes": 1}
+        ],
+        "corrected_units": [
+          {"unit_id": "a", "watts": 2, "minutes": 1},
+          {"unit_id": "b", "watts": 1, "minutes": 1}
+        ]
+      }'
+```
+
+```json
+{
+  "total_cents": 10,
+  "original_total_weight": 2,
+  "corrected_total_weight": 3,
+  "total_adjustment_cents": 0,
+  "adjustments": [
+    {"unit_id": "a", "original_cents": 5, "corrected_cents": 7, "adjustment_cents": 2},
+    {"unit_id": "b", "original_cents": 5, "corrected_cents": 3, "adjustment_cents": -2}
+  ]
+}
+```
+
+读数完全未变化时，每个 `adjustment_cents` 均为 `0`，合计仍为 `0`。
+
 ### 错误响应
 
 所有错误（参数校验、业务规则、404/405、500）都是同一信封，`detail.fields[].loc`
@@ -148,9 +223,10 @@ camera 组小数余数最大，获得该余分。合计 6818 + 2273 + 909 = 1000
 
 | HTTP | code | 触发条件 |
 | --- | --- | --- |
-| 422 | `VALIDATION_ERROR` | 缺字段、负数、浮点/字符串/布尔冒充整数、空 `unit_id`、空 `units`、多余字段、JSON 语法错误等 |
-| 400 | `DUPLICATE_UNIT_ID` | `unit_id` 重复（每个重复出现的位置都会列出） |
-| 400 | `ZERO_TOTAL_WEIGHT` | 所有组 `watts × minutes` 之和为零 |
+| 422 | `VALIDATION_ERROR` | 缺字段、负数、浮点/字符串/布尔冒充整数、空 `unit_id`、空 `units`/读数数组、多余字段、JSON 语法错误等（`/adjustments` 同样适用） |
+| 400 | `DUPLICATE_UNIT_ID` | `unit_id` 重复（每个重复出现的位置都会列出；`/adjustments` 两个数组内各自检查） |
+| 400 | `ZERO_TOTAL_WEIGHT` | `/allocate` 的 `units`，或 `/adjustments` 任一版本读数的权重和为零 |
+| 400 | `UNIT_SET_MISMATCH` | 仅 `/adjustments`：两版读数的 `unit_id` 集合不完全相同（缺失或额外，定位到具体数组元素） |
 | 404 / 405 | `NOT_FOUND` / `METHOD_NOT_ALLOWED` | 路径或方法不存在 |
 | 500 | `INTERNAL_ERROR` | 未预期异常 |
 

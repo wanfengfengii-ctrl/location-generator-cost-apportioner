@@ -24,6 +24,11 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .allocator import DuplicateUnitIdError, ZeroTotalWeightError
+from .adjustments import (
+    AdjustmentDuplicateUnitIdError,
+    AdjustmentZeroTotalWeightError,
+    UnitSetMismatchError,
+)
 
 
 def _envelope(code: str, message: str, fields: list[dict[str, Any]]) -> dict[str, Any]:
@@ -83,6 +88,53 @@ def register_error_handlers(app: FastAPI) -> None:
                 "message": (
                     "every unit has watts*minutes == 0; at least one unit "
                     "must have positive watts and minutes"
+                ),
+            }
+        ]
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content=_envelope("ZERO_TOTAL_WEIGHT", str(exc), fields),
+        )
+
+    @app.exception_handler(AdjustmentDuplicateUnitIdError)
+    async def adjustment_duplicate_unit_id_handler(
+        request: Request, exc: AdjustmentDuplicateUnitIdError
+    ) -> JSONResponse:
+        fields = [
+            {
+                "loc": ["body", array_name, index, "unit_id"],
+                "message": (
+                    f"duplicate unit_id {unit_id!r}; "
+                    f"first occurrence is {array_name}[{first}].unit_id"
+                ),
+            }
+            for array_name, index, unit_id, first in exc.occurrences
+        ]
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content=_envelope("DUPLICATE_UNIT_ID", str(exc), fields),
+        )
+
+    @app.exception_handler(UnitSetMismatchError)
+    async def unit_set_mismatch_handler(
+        request: Request, exc: UnitSetMismatchError
+    ) -> JSONResponse:
+        fields = [{"loc": list(loc), "message": message} for loc, message in exc.fields]
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content=_envelope("UNIT_SET_MISMATCH", str(exc), fields),
+        )
+
+    @app.exception_handler(AdjustmentZeroTotalWeightError)
+    async def adjustment_zero_total_weight_handler(
+        request: Request, exc: AdjustmentZeroTotalWeightError
+    ) -> JSONResponse:
+        fields = [
+            {
+                "loc": ["body", exc.array_name],
+                "message": (
+                    f"every unit in {exc.array_name} has watts*minutes == 0; "
+                    "at least one unit must have positive watts and minutes"
                 ),
             }
         ]

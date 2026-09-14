@@ -68,3 +68,58 @@ class AllocateResponse(BaseModel):
     allocated_cents: int
     remainder_cents_distributed: int
     allocations: list[UnitShareOut]
+
+
+class AdjustmentsRequest(BaseModel):
+    """Body of POST /adjustments: one invoice total, two readings versions.
+
+    ``original_units`` and ``corrected_units`` must each hold at least one
+    entry; their unit_id sets must match exactly (cross-checked by the
+    adjustment service, which can locate individual array elements).
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "examples": [
+                {
+                    "total_cents": 10000,
+                    "original_units": [
+                        {"unit_id": "lighting", "watts": 2000, "minutes": 180},
+                        {"unit_id": "camera", "watts": 800, "minutes": 150},
+                    ],
+                    "corrected_units": [
+                        {"unit_id": "lighting", "watts": 2000, "minutes": 200},
+                        {"unit_id": "camera", "watts": 800, "minutes": 150},
+                    ],
+                }
+            ]
+        },
+    )
+
+    total_cents: NonNegInt
+    original_units: Annotated[list[UnitIn], Field(min_length=1)]
+    corrected_units: Annotated[list[UnitIn], Field(min_length=1)]
+
+
+class UnitAdjustmentOut(BaseModel):
+    """Per-crew delta; ``adjustment_cents`` may be positive, zero or negative."""
+
+    unit_id: str
+    original_cents: int
+    corrected_cents: int
+    adjustment_cents: int
+
+
+class AdjustmentsResponse(BaseModel):
+    """Result of diffing both allocations.
+
+    ``total_adjustment_cents`` is the reconciliation check: both versions
+    split the same invoice total, so the signed deltas always sum to zero.
+    """
+
+    total_cents: int
+    original_total_weight: int
+    corrected_total_weight: int
+    total_adjustment_cents: int
+    adjustments: list[UnitAdjustmentOut]

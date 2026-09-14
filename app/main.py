@@ -6,9 +6,17 @@ from dataclasses import asdict
 
 from fastapi import FastAPI, status
 
+from .adjustments import build_adjustments
 from .allocator import UnitUsage, allocate
 from .errors import register_error_handlers
-from .schemas import AllocateRequest, AllocateResponse, UnitShareOut
+from .schemas import (
+    AdjustmentsRequest,
+    AdjustmentsResponse,
+    AllocateRequest,
+    AllocateResponse,
+    UnitAdjustmentOut,
+    UnitShareOut,
+)
 
 app = FastAPI(
     title="Film Crew Generator Fuel Cost Allocator",
@@ -47,4 +55,30 @@ def allocate_costs(payload: AllocateRequest) -> AllocateResponse:
         allocated_cents=report.allocated_cents,
         remainder_cents_distributed=report.remainder_cents_distributed,
         allocations=[UnitShareOut(**asdict(share)) for share in report.shares],
+    )
+
+
+@app.post(
+    "/adjustments",
+    response_model=AdjustmentsResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["adjustment"],
+    summary="Diff two allocation versions after meter readings are corrected",
+)
+def adjust_costs(payload: AdjustmentsRequest) -> AdjustmentsResponse:
+    original = [
+        UnitUsage(unit_id=u.unit_id, watts=u.watts, minutes=u.minutes)
+        for u in payload.original_units
+    ]
+    corrected = [
+        UnitUsage(unit_id=u.unit_id, watts=u.watts, minutes=u.minutes)
+        for u in payload.corrected_units
+    ]
+    report = build_adjustments(payload.total_cents, original, corrected)
+    return AdjustmentsResponse(
+        total_cents=report.total_cents,
+        original_total_weight=report.original_total_weight,
+        corrected_total_weight=report.corrected_total_weight,
+        total_adjustment_cents=report.total_adjustment_cents,
+        adjustments=[UnitAdjustmentOut(**asdict(item)) for item in report.adjustments],
     )

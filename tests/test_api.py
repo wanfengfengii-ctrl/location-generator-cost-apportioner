@@ -47,6 +47,10 @@ def _allocate(client: httpx.Client, payload: dict) -> httpx.Response:
     return client.post("/allocate", json=payload)
 
 
+def _adjust(client: httpx.Client, payload: dict) -> httpx.Response:
+    return client.post("/adjustments", json=payload)
+
+
 def _by_unit_id(body: dict) -> dict:
     return {item["unit_id"]: item for item in body["allocations"]}
 
@@ -435,5 +439,254 @@ class TestRoutingErrors:
 
     def test_wrong_method(self, client: httpx.Client) -> None:
         resp = client.get("/allocate")
+        assert resp.status_code == 405
+        assert resp.json()["detail"]["code"] == "METHOD_NOT_ALLOWED"
+
+
+class TestAdjustments:
+    def _payload(self, original, corrected, total_cents=10):
+        return {
+            "total_cents": total_cents,
+            "original_units": [
+                {"unit_id": uid, "watts": w, "minutes": m} for uid, w, m in original
+            ],
+            "corrected_units": [
+                {"unit_id": uid, "watts": w, "minutes": m} for uid, w, m in corrected
+            ],
+        }
+
+    def test_corrected_readings_produce_offsetting_deltas(self, client: httpx.Client) -> None:
+        # total 10: 50/50 -> 2:1 split (the heavier crew also wins Hamilton's
+        # leftover cent): +2 for "a", -2 for "b", net zero.
+        resp = _adjust(
+            client,
+            self._payload(
+                [("a", 1, 1), ("b", 1, 1)],
+                [("a", 2, 1), ("b", 1, 1)],
+            ),
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["total_cents"] == 10
+        assert body["original_total_weight"] == 2
+        assert body["corrected_total_weight"] == 3
+        by_id = {item["unit_id"]: item for item in body["adjustments"]}
+        assert by_id["a"] == {
+            "unit_id": "a",
+            "original_cents": 5,
+            "corrected_cents": 7,
+            "adjustment_cents": 2,
+        }
+        assert by_id["b"] == {
+            "unit_id": "b",
+            "original_cents": 5,
+            "corrected_cents": 3,
+            "adjustment_cents": -2,
+        }
+        assert body["total_adjustment_cents"] == 0
+        assert sum(item["adjustment_cents"] for item in body["adjustments"]) == 0
+
+    def test_unchanged_readings_yield_zero_adjustments(self, client: httpx.Client) -> None:
+        readings = [("lighting", 2000, 180), ("camera", 800, 150), ("vfx", 500, 96)]
+        resp = _adjust(client, self._payload(readings, readings, total_cents=10000))
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["original_total_weight"] == body["corrected_total_weight"] == 528000
+        assert body["total_adjustment_cents"] == 0
+        assert len(body["adjustments"]) == 3
+        assert all(item["adjustment_cents"] == 0 for item in body["adjustments"])
+        assert all(
+            item["original_cents"] == item["corrected_cents"] for item in body["adjustments"]
+        )
+
+    def test_result_matches_two_allocate_calls(self, client: httpx.Client) -> None:
+        payload = self._payload(
+            [("a", 2, 3), ("b", 1, 6), ("c", 5, 5)],
+            [("a", 2, 4), ("b", 1, 6), ("c", 4, 5)],
+            total_cents=9999,
+        )
+        resp = _adjust(client, payload)
+        assert resp.status_code == 200
+        by_id = {item["unit_id"]: item for item in resp.json()["adjustments"]}
+        for array_name in ("original_units", "corrected_units"):
+            allocate_resp = _allocate(
+                client,
+                {
+                    "total_cents": payload["total_cents"],
+                    "units": payload[array_name],
+                },
+            )
+            assert allocate_resp.status_code == 200
+            for allocation in allocate_resp.json()["allocations"]:
+                item = by_id[allocation["unit_id"]]
+                key = "original_cents" if array_name == "original_units" else "corrected_cents"
+                assert item[key] == allocation["final_cents"]
+        assert resp.json()["total_adjustment_cents"] == 0
+
+    def test_response_order_follows_original_units(self, client: httpx.Client) -> None:
+        resp = _adjust(
+            client,
+            self._payload(
+                [("zeta", 1, 1), ("alpha", 2, 1), ("mike", 3, 1)],
+                [("mike", 3, 1), ("zeta", 1, 1), ("alpha", 2, 1)],
+                total_cents=100,
+            ),
+        )
+        assert resp.status_code == 200
+        assert [item["unit_id"] for item in resp.json()["adjustments"]] == [
+            "zeta",
+            "alpha",
+            "mike",
+        ]
+
+    def test_missing_unit_id_locates_both_array_elements(self, client: httpx.Client) -> None:
+        # 'b' exists only in original_units, 'c' only in corrected_units.
+        resp = _adjust(
+            client,
+            self._payload(
+                [("a", 1, 1), ("b", 1, 1)],
+                [("a", 2, 2), ("c", 1, 1)],
+            ),
+        )
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert detail["code"] == "UNIT_SET_MISMATCH"
+        locs = [f["loc"] for f in detail["fields"]]
+        assert ["body", "original_units", 1] in locs
+        assert ["body", "corrected_units", 1] in locs
+
+    def test_extra_unit_id_is_located_in_corrected_array(self, client: httpx.Client) -> None:
+        resp = _adjust(
+            client,
+            self._payload(
+                [("a", 1, 1)],
+                [("a", 1, 1), ("b", 1, 1)],
+            ),
+        )
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert detail["code"] == "UNIT_SET_MISMATCH"
+        locs = [f["loc"] for f in detail["fields"]]
+        assert ["body", "corrected_units", 1] in locs
+        assert all(loc[1] != "original_units" for loc in locs)
+
+    def test_duplicate_unit_id_in_either_array_is_located(self, client: httpx.Client) -> None:
+        resp = _adjust(
+            client,
+            {
+                "total_cents": 10,
+                "original_units": [
+                    {"unit_id": "a", "watts": 1, "minutes": 1},
+                    {"unit_id": "b", "watts": 1, "minutes": 1},
+                ],
+                "corrected_units": [
+                    {"unit_id": "a", "watts": 1, "minutes": 1},
+                    {"unit_id": "a", "watts": 2, "minutes": 2},
+                ],
+            },
+        )
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert detail["code"] == "DUPLICATE_UNIT_ID"
+        assert ["body", "corrected_units", 1, "unit_id"] in [
+            f["loc"] for f in detail["fields"]
+        ]
+
+    def test_zero_weight_in_either_version_rejected(self, client: httpx.Client) -> None:
+        base = {
+            "total_cents": 10,
+            "original_units": [
+                {"unit_id": "a", "watts": 1, "minutes": 1},
+                {"unit_id": "b", "watts": 2, "minutes": 2},
+            ],
+            "corrected_units": [
+                {"unit_id": "a", "watts": 0, "minutes": 5},
+                {"unit_id": "b", "watts": 3, "minutes": 0},
+            ],
+        }
+        resp = _adjust(client, base)
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert detail["code"] == "ZERO_TOTAL_WEIGHT"
+        assert any(
+            f["loc"] == ["body", "corrected_units"] for f in detail["fields"]
+        )
+
+    @pytest.mark.parametrize("bad_total", [-1, 10.5, "100", True, None])
+    def test_strict_integer_total_rejected(self, client: httpx.Client, bad_total) -> None:
+        payload = self._payload([("a", 1, 1)], [("a", 2, 2)])
+        payload["total_cents"] = bad_total
+        resp = _adjust(client, payload)
+        assert resp.status_code == 422
+        fields = resp.json()["detail"]["fields"]
+        assert any(f["loc"][:2] == ["body", "total_cents"] for f in fields)
+
+    @pytest.mark.parametrize(
+        "array_name,field,value",
+        [
+            ("original_units", "watts", -1),
+            ("corrected_units", "minutes", 1.5),
+            ("original_units", "watts", "5"),
+            ("corrected_units", "minutes", True),
+        ],
+    )
+    def test_strict_integer_readings_rejected(
+        self, client: httpx.Client, array_name, field, value
+    ) -> None:
+        payload = self._payload([("a", 1, 1)], [("a", 2, 2)])
+        payload[array_name][0][field] = value
+        resp = _adjust(client, payload)
+        assert resp.status_code == 422
+        fields = resp.json()["detail"]["fields"]
+        assert any(f["loc"] == ["body", array_name, 0, field] for f in fields)
+
+    def test_empty_readings_array_rejected(self, client: httpx.Client) -> None:
+        resp = _adjust(
+            client,
+            {
+                "total_cents": 10,
+                "original_units": [],
+                "corrected_units": [{"unit_id": "a", "watts": 1, "minutes": 1}],
+            },
+        )
+        assert resp.status_code == 422
+        fields = resp.json()["detail"]["fields"]
+        assert any(f["loc"] == ["body", "original_units"] for f in fields)
+
+    def test_missing_readings_array_rejected(self, client: httpx.Client) -> None:
+        resp = _adjust(
+            client,
+            {
+                "total_cents": 10,
+                "original_units": [{"unit_id": "a", "watts": 1, "minutes": 1}],
+            },
+        )
+        assert resp.status_code == 422
+        fields = resp.json()["detail"]["fields"]
+        assert any(f["loc"] == ["body", "corrected_units"] for f in fields)
+
+    def test_extra_field_rejected_and_located(self, client: httpx.Client) -> None:
+        payload = self._payload([("a", 1, 1)], [("a", 2, 2)])
+        payload["original_units"][0]["unexpected"] = 9
+        resp = _adjust(client, payload)
+        assert resp.status_code == 422
+        fields = resp.json()["detail"]["fields"]
+        assert any(
+            f["loc"] == ["body", "original_units", 0, "unexpected"] for f in fields
+        )
+
+    def test_malformed_json_located(self, client: httpx.Client) -> None:
+        resp = client.post(
+            "/adjustments",
+            content=b"{not json",
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert detail["code"] == "VALIDATION_ERROR"
+        assert any(f["loc"][0] == "body" for f in detail["fields"])
+
+    def test_get_on_adjustments_not_allowed(self, client: httpx.Client) -> None:
+        resp = client.get("/adjustments")
         assert resp.status_code == 405
         assert resp.json()["detail"]["code"] == "METHOD_NOT_ALLOWED"
