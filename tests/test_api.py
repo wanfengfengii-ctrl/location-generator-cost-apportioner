@@ -51,6 +51,10 @@ def _adjust(client: httpx.Client, payload: dict) -> httpx.Response:
     return client.post("/adjustments", json=payload)
 
 
+def _allocate_bounded(client: httpx.Client, payload: dict) -> httpx.Response:
+    return client.post("/allocate-bounded", json=payload)
+
+
 def _by_unit_id(body: dict) -> dict:
     return {item["unit_id"]: item for item in body["allocations"]}
 
@@ -439,6 +443,278 @@ class TestRoutingErrors:
 
     def test_wrong_method(self, client: httpx.Client) -> None:
         resp = client.get("/allocate")
+        assert resp.status_code == 405
+        assert resp.json()["detail"]["code"] == "METHOD_NOT_ALLOWED"
+
+
+class TestAllocateBounded:
+    def _bounded_by_id(self, body: dict) -> dict:
+        return {item["unit_id"]: item for item in body["allocations"]}
+
+    def test_multi_round_cap_relocking_reconciles(self, client: httpx.Client) -> None:
+        # Equal weights, caps 20 / 40 / 100 over 100 cents: the first two
+        # crews lock at their caps in successive rounds, the rest goes to c.
+        resp = _allocate_bounded(
+            client,
+            {
+                "total_cents": 100,
+                "units": [
+                    {"unit_id": "a", "watts": 1, "minutes": 1,
+                     "minimum_cents": 0, "maximum_cents": 20},
+                    {"unit_id": "b", "watts": 1, "minutes": 1,
+                     "minimum_cents": 0, "maximum_cents": 40},
+                    {"unit_id": "c", "watts": 1, "minutes": 1,
+                     "minimum_cents": 0, "maximum_cents": 100},
+                ],
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["allocated_cents"] == 100
+        assert body["total_cents"] == 100
+        by_id = self._bounded_by_id(body)
+        assert by_id["a"] == {
+            "unit_id": "a", "weight": 1,
+            "minimum_cents": 0, "maximum_cents": 20,
+            "final_cents": 20, "amount_basis": "maximum",
+        }
+        assert by_id["b"]["final_cents"] == 40
+        assert by_id["b"]["amount_basis"] == "maximum"
+        assert by_id["c"]["final_cents"] == 40
+        assert by_id["c"]["amount_basis"] == "weighted"
+        assert sum(item["final_cents"] for item in body["allocations"]) == 100
+
+    def test_minimums_held_and_zero_weight_crew_floored(self, client) -> None:
+        resp = _allocate_bounded(
+            client,
+            {
+                "total_cents": 90,
+                "units": [
+                    {"unit_id": "a", "watts": 1, "minutes": 1,
+                     "minimum_cents": 10, "maximum_cents": 100},
+                    {"unit_id": "z", "watts": 0, "minutes": 9,
+                     "minimum_cents": 15, "maximum_cents": 999},
+                    {"unit_id": "c", "watts": 3, "minutes": 1,
+                     "minimum_cents": 5, "maximum_cents": 100},
+                ],
+            },
+        )
+        assert resp.status_code == 200
+        by_id = self._bounded_by_id(resp.json())
+        assert (by_id["a"]["final_cents"], by_id["a"]["amount_basis"]) == (25, "weighted")
+        assert (by_id["z"]["final_cents"], by_id["z"]["amount_basis"]) == (15, "minimum")
+        assert by_id["z"]["weight"] == 0
+        assert (by_id["c"]["final_cents"], by_id["c"]["amount_basis"]) == (50, "weighted")
+
+    def test_remainder_tie_broken_by_utf8_bytes(self, client: httpx.Client) -> None:
+        resp = _allocate_bounded(
+            client,
+            {
+                "total_cents": 3,
+                "units": [
+                    {"unit_id": "équipe", "watts": 2, "minutes": 2,
+                     "minimum_cents": 0, "maximum_cents": 100},
+                    {"unit_id": "zebra", "watts": 2, "minutes": 2,
+                     "minimum_cents": 0, "maximum_cents": 100},
+                ],
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["remainder_cents_distributed"] == 1
+        by_id = self._bounded_by_id(body)
+        assert by_id["zebra"]["final_cents"] == 2
+        assert by_id["équipe"]["final_cents"] == 1
+
+    def test_total_equal_to_minimum_total(self, client: httpx.Client) -> None:
+        resp = _allocate_bounded(
+            client,
+            {
+                "total_cents": 25,
+                "units": [
+                    {"unit_id": "a", "watts": 2, "minutes": 2,
+                     "minimum_cents": 10, "maximum_cents": 10},
+                    {"unit_id": "b", "watts": 3, "minutes": 3,
+                     "minimum_cents": 5, "maximum_cents": 50},
+                    {"unit_id": "z", "watts": 0, "minutes": 4,
+                     "minimum_cents": 10, "maximum_cents": 10},
+                ],
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["allocated_cents"] == 25
+        assert body["remainder_cents_distributed"] == 0
+        for allocation in body["allocations"]:
+            assert allocation["final_cents"] == allocation["minimum_cents"]
+            assert allocation["amount_basis"] == "minimum"
+
+    def test_response_preserves_input_order(self, client: httpx.Client) -> None:
+        resp = _allocate_bounded(
+            client,
+            {
+                "total_cents": 50,
+                "units": [
+                    {"unit_id": "zeta", "watts": 1, "minutes": 1,
+                     "minimum_cents": 0, "maximum_cents": 100},
+                    {"unit_id": "alpha", "watts": 1, "minutes": 1,
+                     "minimum_cents": 0, "maximum_cents": 100},
+                    {"unit_id": "mike", "watts": 0, "minutes": 0,
+                     "minimum_cents": 4, "maximum_cents": 4},
+                ],
+            },
+        )
+        assert resp.status_code == 200
+        assert [a["unit_id"] for a in resp.json()["allocations"]] == [
+            "zeta", "alpha", "mike",
+        ]
+
+    def test_inverted_bounds_all_reported_in_position_order(self, client) -> None:
+        resp = _allocate_bounded(
+            client,
+            {
+                "total_cents": 100,
+                "units": [
+                    {"unit_id": "ok", "watts": 1, "minutes": 1,
+                     "minimum_cents": 0, "maximum_cents": 10},
+                    {"unit_id": "bad1", "watts": 1, "minutes": 1,
+                     "minimum_cents": 8, "maximum_cents": 3},
+                    {"unit_id": "equal", "watts": 1, "minutes": 1,
+                     "minimum_cents": 9, "maximum_cents": 9},
+                    {"unit_id": "bad3", "watts": 1, "minutes": 1,
+                     "minimum_cents": 4, "maximum_cents": 1},
+                ],
+            },
+        )
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert detail["code"] == "BOUNDS_INVERTED"
+        locs = [f["loc"] for f in detail["fields"]]
+        assert locs == [
+            ["body", "units", 1, "minimum_cents"],
+            ["body", "units", 3, "minimum_cents"],
+        ]
+
+    def test_total_below_minimum_total_rejected_without_partial_results(
+        self, client: httpx.Client
+    ) -> None:
+        resp = _allocate_bounded(
+            client,
+            {
+                "total_cents": 9,
+                "units": [
+                    {"unit_id": "a", "watts": 1, "minutes": 1,
+                     "minimum_cents": 5, "maximum_cents": 50},
+                    {"unit_id": "b", "watts": 2, "minutes": 2,
+                     "minimum_cents": 5, "maximum_cents": 50},
+                ],
+            },
+        )
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert detail["code"] == "INFEASIBLE_BOUNDS"
+        assert "below" in detail["message"]
+        assert any(f["loc"] == ["body", "total_cents"] for f in detail["fields"])
+        assert "allocations" not in resp.json()
+
+    def test_total_above_distributable_cap_rejected(self, client: httpx.Client) -> None:
+        # The zero-weight crew's generous maximum cannot absorb surplus; the
+        # only positive-weight crew caps at 50.
+        resp = _allocate_bounded(
+            client,
+            {
+                "total_cents": 100,
+                "units": [
+                    {"unit_id": "z", "watts": 0, "minutes": 3,
+                     "minimum_cents": 0, "maximum_cents": 1000},
+                    {"unit_id": "a", "watts": 1, "minutes": 1,
+                     "minimum_cents": 0, "maximum_cents": 50},
+                ],
+            },
+        )
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert detail["code"] == "INFEASIBLE_BOUNDS"
+        assert "exceeds" in detail["message"]
+
+    def test_duplicate_unit_id_rejected_and_located(self, client: httpx.Client) -> None:
+        resp = _allocate_bounded(
+            client,
+            {
+                "total_cents": 20,
+                "units": [
+                    {"unit_id": "a", "watts": 1, "minutes": 1,
+                     "minimum_cents": 0, "maximum_cents": 10},
+                    {"unit_id": "a", "watts": 2, "minutes": 2,
+                     "minimum_cents": 0, "maximum_cents": 10},
+                ],
+            },
+        )
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert detail["code"] == "DUPLICATE_UNIT_ID"
+        assert ["body", "units", 1, "unit_id"] in [f["loc"] for f in detail["fields"]]
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("minimum_cents", -1),
+            ("maximum_cents", -5),
+            ("minimum_cents", 1.5),
+            ("maximum_cents", "60"),
+            ("minimum_cents", True),
+            ("watts", 2.0),
+        ],
+    )
+    def test_invalid_unit_numbers_rejected(self, client: httpx.Client, field, value) -> None:
+        unit = {
+            "unit_id": "a", "watts": 1, "minutes": 1,
+            "minimum_cents": 0, "maximum_cents": 100, field: value,
+        }
+        resp = _allocate_bounded(client, {"total_cents": 10, "units": [unit]})
+        assert resp.status_code == 422
+        fields = resp.json()["detail"]["fields"]
+        assert any(f["loc"] == ["body", "units", 0, field] for f in fields)
+
+    def test_missing_bound_field_located(self, client: httpx.Client) -> None:
+        resp = _allocate_bounded(
+            client,
+            {
+                "total_cents": 10,
+                "units": [{"unit_id": "a", "watts": 1, "minutes": 1,
+                           "minimum_cents": 0}],
+            },
+        )
+        assert resp.status_code == 422
+        fields = resp.json()["detail"]["fields"]
+        assert any(f["loc"] == ["body", "units", 0, "maximum_cents"] for f in fields)
+
+    def test_extra_field_rejected_and_located(self, client: httpx.Client) -> None:
+        resp = _allocate_bounded(
+            client,
+            {
+                "total_cents": 10,
+                "units": [
+                    {"unit_id": "a", "watts": 1, "minutes": 1,
+                     "minimum_cents": 0, "maximum_cents": 10, "unexpected": 3}
+                ],
+            },
+        )
+        assert resp.status_code == 422
+        fields = resp.json()["detail"]["fields"]
+        assert any(f["loc"] == ["body", "units", 0, "unexpected"] for f in fields)
+
+    def test_malformed_json_located(self, client: httpx.Client) -> None:
+        resp = client.post(
+            "/allocate-bounded",
+            content=b"{not json",
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"]["code"] == "VALIDATION_ERROR"
+
+    def test_get_not_allowed(self, client: httpx.Client) -> None:
+        resp = client.get("/allocate-bounded")
         assert resp.status_code == 405
         assert resp.json()["detail"]["code"] == "METHOD_NOT_ALLOWED"
 

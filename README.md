@@ -3,8 +3,9 @@
 纯后端 HTTP JSON 服务（Python 3.12 + FastAPI）。外景拍摄结束后，把同一台移动
 发电机的燃料发票总额（整数分）按各摄制组的 `watts × minutes` 整数权重，用
 **最大余数法（Hamilton 分摊）**拆到每个摄制组，保证分摊明细合计**始终严格等于**
-发票总额，财务可直接对平。读数事后更正时，`POST /adjustments` 对同一发票总额
-各跑一次原始版与更正版分摊，直接返回每组可正可负的调账差额（合计恒为零）。
+发票总额，财务可直接对平。合同另定每组保底/封顶时，`POST /allocate-bounded`
+在多轮封顶重算中直接纳入这些约束。读数事后更正时，`POST /adjustments` 对同一发票
+总额各跑一次原始版与更正版分摊，直接返回每组可正可负的调账差额（合计恒为零）。
 
 ## 分摊算法与不变量
 
@@ -24,14 +25,16 @@
 
 ```
 app/
-  main.py         # FastAPI 应用与路由（POST /allocate、POST /adjustments、GET /health）
+  main.py         # FastAPI 应用与路由（POST /allocate、POST /allocate-bounded、POST /adjustments、GET /health）
   allocator.py    # 最大余数法核心逻辑（纯 Python，无框架依赖）
+  bounded.py      # 保底/封顶约束下的水填充分摊（多轮锁定封顶 + 最大余数收尾，纯 Python）
   adjustments.py  # 调账编排：两版读数各跑一次分摊，按 unit_id 合并出差额
   schemas.py      # 请求/响应模型（严格非负整数校验）
   errors.py       # 统一错误信封，所有错误返回可定位字段
 tests/
   test_api.py          # HTTP 验收测试（可打真实服务或进程内 TestClient）
   test_allocator.py    # 分摊逻辑单元测试（含随机化不变量校验）
+  test_bounded.py      # 保底/封顶分摊单元测试（含随机化不变量与独立参照实现）
   test_adjustments.py  # 调账编排单元测试（含集合并发、整批拒绝校验）
 Dockerfile           # python:3.12-slim 单镜像
 compose.yaml         # api 服务 + 一次性 verify 验收服务
@@ -131,6 +134,89 @@ curl -s -X POST http://localhost:${API_PORT:-8000}/allocate \
 上例中三组精确份额为 6818.18…、2272.72…、909.09… 分；向下取整后剩 1 分，
 camera 组小数余数最大，获得该余分。合计 6818 + 2273 + 909 = 10000，与发票对平。
 
+### `POST /allocate-bounded`
+
+摄制组合同可能约定每组的燃料费**保底额**（`minimum_cents`）与**封顶额**
+（`maximum_cents`）。本端点在用量分摊中直接纳入这些约束：
+
+1. 每组先拿到保底额，可分配余额 = `total_cents − Σminimum_cents`；
+2. 余额只在**权重为正且未封顶**的组间按当前权重计算精确增量
+   （`余额 × 权重 / 当前权重和`，全程整数交叉相乘，无浮点误差）；
+3. 每轮把所有「增量 ≥ 自身剩余容量」的组一起锁定到封顶额，扣除这些容量后
+   用剩余组重算权重，循环直至某轮没有新锁定项；
+4. 最后在幸存组间沿用 `/allocate` 的**最大余数法**分完整数分，余数同分时按
+   `unit_id` 的 UTF-8 字节序升序决胜。
+
+零权重组不参与余额分配，只能取得保底额（其 `maximum_cents` 不抬高可分配上限）。
+响应保持输入顺序，逐组返回 `weight`、`minimum_cents`、`maximum_cents`、
+`final_cents` 与 `amount_basis`（`minimum` / `weighted` / `maximum`，标明最终金额
+由保底、按权重还是封顶决定）。恒有每组 `minimum_cents ≤ final_cents ≤ maximum_cents`
+且 `Σfinal_cents == total_cents`。
+
+请求体：
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `total_cents` | int | 非负整数（与 `/allocate` 相同的严格整数校验） |
+| `units` | array | 至少 1 个元素 |
+| `units[].unit_id` | string | 非空，批内唯一（重复时沿用 `/allocate` 的 `DUPLICATE_UNIT_ID` 定位错误） |
+| `units[].watts` / `units[].minutes` | int | 非负整数 |
+| `units[].minimum_cents` / `units[].maximum_cents` | int | 非负整数，且每组必须满足 `minimum_cents ≤ maximum_cents` |
+
+整批拒绝规则（校验按序分阶段，任何不可行请求均不返回部分结果）：
+
+- `unit_id` 重复 → `400 DUPLICATE_UNIT_ID`；
+- 存在上下限倒置 → `400 BOUNDS_INVERTED`，**一次返回全部**倒置项，按输入位置
+  排序定位；
+- `total_cents < Σminimum_cents` 或
+  `total_cents > Σ(正权重组 maximum_cents) + Σ(零权重组 minimum_cents)`
+  → `400 INFEASIBLE_BOUNDS`。
+
+成功响应 `200`：
+
+| 字段 | 含义 |
+| --- | --- |
+| `total_cents` / `total_weight` | 发票总额（分）/ 权重总和 |
+| `allocated_cents` | 分摊合计，恒等于 `total_cents` |
+| `remainder_cents_distributed` | 最后幸存组阶段发出的余分总数 |
+| `allocations[].weight` | 该组权重 `watts × minutes` |
+| `allocations[].minimum_cents` / `maximum_cents` | 合同保底额 / 封顶额 |
+| `allocations[].final_cents` | 最终金额（整数分，落在区间内） |
+| `allocations[].amount_basis` | `minimum` / `weighted` / `maximum` |
+
+示例（等额权重、封顶 20/40/100，总额 100：前两组在两轮重算中先后锁定封顶，
+余额 40 全归第三组）：
+
+```bash
+curl -s -X POST http://localhost:${API_PORT:-8000}/allocate-bounded \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "total_cents": 100,
+        "units": [
+          {"unit_id": "a", "watts": 1, "minutes": 1, "minimum_cents": 0, "maximum_cents": 20},
+          {"unit_id": "b", "watts": 1, "minutes": 1, "minimum_cents": 0, "maximum_cents": 40},
+          {"unit_id": "c", "watts": 1, "minutes": 1, "minimum_cents": 0, "maximum_cents": 100}
+        ]
+      }'
+```
+
+```json
+{
+  "total_cents": 100,
+  "total_weight": 3,
+  "allocated_cents": 100,
+  "remainder_cents_distributed": 0,
+  "allocations": [
+    {"unit_id": "a", "weight": 1, "minimum_cents": 0, "maximum_cents": 20,
+     "final_cents": 20, "amount_basis": "maximum"},
+    {"unit_id": "b", "weight": 1, "minimum_cents": 0, "maximum_cents": 40,
+     "final_cents": 40, "amount_basis": "maximum"},
+    {"unit_id": "c", "weight": 1, "minimum_cents": 0, "maximum_cents": 100,
+     "final_cents": 40, "amount_basis": "weighted"}
+  ]
+}
+```
+
 ### `POST /adjustments`
 
 拍摄结束后若摄制组更正了功率或使用时长，会计直接取得两版分摊的**调账差额**，
@@ -226,6 +312,8 @@ curl -s -X POST http://localhost:${API_PORT:-8000}/adjustments \
 | 422 | `VALIDATION_ERROR` | 缺字段、负数、浮点/字符串/布尔冒充整数、空 `unit_id`、空 `units`/读数数组、多余字段、JSON 语法错误等（`/adjustments` 同样适用） |
 | 400 | `DUPLICATE_UNIT_ID` | `unit_id` 重复（每个重复出现的位置都会列出；`/adjustments` 两个数组内各自检查） |
 | 400 | `ZERO_TOTAL_WEIGHT` | `/allocate` 的 `units`，或 `/adjustments` 任一版本读数的权重和为零 |
+| 400 | `BOUNDS_INVERTED` | 仅 `/allocate-bounded`：至少一组 `minimum_cents > maximum_cents`（一次返回全部倒置项，按输入位置排序） |
+| 400 | `INFEASIBLE_BOUNDS` | 仅 `/allocate-bounded`：`total_cents` 低于保底合计或高于可分配上限（零权重组只能取得保底额） |
 | 400 | `UNIT_SET_MISMATCH` | 仅 `/adjustments`：两版读数的 `unit_id` 集合不完全相同（缺失或额外，定位到具体数组元素） |
 | 404 / 405 | `NOT_FOUND` / `METHOD_NOT_ALLOWED` | 路径或方法不存在 |
 | 500 | `INTERNAL_ERROR` | 未预期异常 |

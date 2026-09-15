@@ -8,12 +8,16 @@ from fastapi import FastAPI, status
 
 from .adjustments import build_adjustments
 from .allocator import UnitUsage, allocate
+from .bounded import BoundedUnit, allocate_bounded
 from .errors import register_error_handlers
 from .schemas import (
     AdjustmentsRequest,
     AdjustmentsResponse,
+    AllocateBoundedRequest,
+    AllocateBoundedResponse,
     AllocateRequest,
     AllocateResponse,
+    BoundedUnitShareOut,
     UnitAdjustmentOut,
     UnitShareOut,
 )
@@ -55,6 +59,44 @@ def allocate_costs(payload: AllocateRequest) -> AllocateResponse:
         allocated_cents=report.allocated_cents,
         remainder_cents_distributed=report.remainder_cents_distributed,
         allocations=[UnitShareOut(**asdict(share)) for share in report.shares],
+    )
+
+
+@app.post(
+    "/allocate-bounded",
+    response_model=AllocateBoundedResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["allocation"],
+    summary="Split a fuel bill with per-crew minimum floors and maximum caps",
+)
+def allocate_bounded_costs(payload: AllocateBoundedRequest) -> AllocateBoundedResponse:
+    usages = [
+        BoundedUnit(
+            unit_id=u.unit_id,
+            watts=u.watts,
+            minutes=u.minutes,
+            minimum_cents=u.minimum_cents,
+            maximum_cents=u.maximum_cents,
+        )
+        for u in payload.units
+    ]
+    report = allocate_bounded(payload.total_cents, usages)
+    return AllocateBoundedResponse(
+        total_cents=report.total_cents,
+        total_weight=report.total_weight,
+        allocated_cents=report.allocated_cents,
+        remainder_cents_distributed=report.remainder_cents_distributed,
+        allocations=[
+            BoundedUnitShareOut(
+                unit_id=share.unit_id,
+                weight=share.weight,
+                minimum_cents=share.minimum_cents,
+                maximum_cents=share.maximum_cents,
+                final_cents=share.final_cents,
+                amount_basis=share.amount_basis,
+            )
+            for share in report.shares
+        ],
     )
 
 

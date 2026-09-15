@@ -29,6 +29,7 @@ from .adjustments import (
     AdjustmentZeroTotalWeightError,
     UnitSetMismatchError,
 )
+from .bounded import BoundsInvertedError, InfeasibleBoundsError
 
 
 def _envelope(code: str, message: str, fields: list[dict[str, Any]]) -> dict[str, Any]:
@@ -94,6 +95,45 @@ def register_error_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
             content=_envelope("ZERO_TOTAL_WEIGHT", str(exc), fields),
+        )
+
+    @app.exception_handler(BoundsInvertedError)
+    async def bounds_inverted_handler(
+        request: Request, exc: BoundsInvertedError
+    ) -> JSONResponse:
+        fields = [
+            {
+                "loc": ["body", "units", index, "minimum_cents"],
+                "message": (
+                    f"minimum_cents ({minimum}) must be <= maximum_cents ({maximum}) "
+                    f"for units[{index}]"
+                ),
+            }
+            for index, minimum, maximum in exc.inversions
+        ]
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content=_envelope("BOUNDS_INVERTED", str(exc), fields),
+        )
+
+    @app.exception_handler(InfeasibleBoundsError)
+    async def infeasible_bounds_handler(
+        request: Request, exc: InfeasibleBoundsError
+    ) -> JSONResponse:
+        fields = [
+            {
+                "loc": ["body", "total_cents"],
+                "message": (
+                    f"feasible range for total_cents is "
+                    f"[{exc.minimum_total}, {exc.distributable_maximum}] "
+                    f"(sum of minimum_cents .. sum of positive-weight maximum_cents "
+                    "plus zero-weight minimum_cents)"
+                ),
+            }
+        ]
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content=_envelope("INFEASIBLE_BOUNDS", str(exc), fields),
         )
 
     @app.exception_handler(AdjustmentDuplicateUnitIdError)

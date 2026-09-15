@@ -70,6 +70,80 @@ class AllocateResponse(BaseModel):
     allocations: list[UnitShareOut]
 
 
+class BoundedUnitIn(BaseModel):
+    """One crew's usage with its guaranteed minimum and capped maximum."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    unit_id: Annotated[str, Field(min_length=1, max_length=128)]
+    watts: NonNegInt
+    minutes: NonNegInt
+    minimum_cents: NonNegInt
+    maximum_cents: NonNegInt
+
+
+class AllocateBoundedRequest(BaseModel):
+    """Body of POST /allocate-bounded: invoice total, usage, floors and caps."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "examples": [
+                {
+                    "total_cents": 10000,
+                    "units": [
+                        {
+                            "unit_id": "lighting",
+                            "watts": 2000,
+                            "minutes": 180,
+                            "minimum_cents": 3000,
+                            "maximum_cents": 8000,
+                        },
+                        {
+                            "unit_id": "camera",
+                            "watts": 800,
+                            "minutes": 150,
+                            "minimum_cents": 1000,
+                            "maximum_cents": 4000,
+                        },
+                        {
+                            "unit_id": "vfx",
+                            "watts": 500,
+                            "minutes": 96,
+                            "minimum_cents": 500,
+                            "maximum_cents": 2000,
+                        },
+                    ],
+                }
+            ]
+        },
+    )
+
+    total_cents: NonNegInt
+    units: Annotated[list[BoundedUnitIn], Field(min_length=1)]
+
+
+class BoundedUnitShareOut(BaseModel):
+    """Per-crew bounded result: weight, bounds, final amount, and its basis."""
+
+    unit_id: str
+    weight: int
+    minimum_cents: int
+    maximum_cents: int
+    final_cents: int
+    amount_basis: str
+
+
+class AllocateBoundedResponse(BaseModel):
+    """Full bounded split; ``allocated_cents`` always equals ``total_cents``."""
+
+    total_cents: int
+    total_weight: int
+    allocated_cents: int
+    remainder_cents_distributed: int
+    allocations: list[BoundedUnitShareOut]
+
+
 class AdjustmentsRequest(BaseModel):
     """Body of POST /adjustments: one invoice total, two readings versions.
 
